@@ -1,0 +1,176 @@
+
+name: Sarvam AI Auto Fix
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  autofix:
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout failed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Download failed logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run view "${{ github.event.workflow_run.id }}" \
+            --log-failed > error.log || true
+
+      - name: Generate fix using Sarvam
+        env:
+          SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import json
+          import urllib.request
+
+          logs = open(
+              "error.log",
+              encoding="utf-8",
+              errors="replace"
+          ).read()
+
+          prompt = f"""
+          You are an expert software engineer fixing a failed CI build.
+
+          Analyze the errors and generate a minimal code fix.
+
+          Rules:
+          - Return ONLY a unified git diff.
+          - Do not include markdown code fences.
+          - Only modify existing source code files.
+          - Do not modify GitHub workflows.
+          - Do not modify secrets, credentials or environment files.
+          - Do not modify package lock files.
+          - Do not invent project files.
+          - Fix the actual root cause.
+          - Keep the change minimal.
+
+          Failed CI logs:
+
+          {logs[-12000:]}
+          """
+
+          data = json.dumps({
+              "model": "sarvam-105b",
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": "You are a senior software engineer. Return only a valid unified git diff."
+                  },
+                  {
+                      "role": "user",
+                      "content": prompt
+                  }
+              ],
+              "temperature": 0.1
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.sarvam.ai/v1/chat/completions",
+              data=data,
+              headers={
+                  "api-subscription-key": os.environ["SARVAM_API_KEY"],
+                  "Content-Type": "application/json"
+              }
+          )
+
+          with urllib.request.urlopen(req, timeout=180) as response:
+              result = json.loads(response.read())
+
+          patch = result["choices"][0]["message"]["content"]
+
+          if patch.startswith("```"):
+              patch = patch.split("\n", 1)[1]
+              patch = patch.rsplit("```", 1)[0]
+
+          if not patch.strip().startswith("diff --git"):
+              raise Exception("Sarvam did not return a valid diff")
+
+          with open("sarvam.patch", "w") as f:
+              f.write(patch)
+
+          print("Sarvam generated a patch.")
+          PY
+
+      - name: Validate patch
+        run: |
+          python3 - <<'PY'
+          import re
+          import subprocess
+
+          patch = open("sarvam.patch").read()
+
+          paths = re.findall(
+              r'^\+\+\+ b/(.+)$',
+              patch,
+              re.MULTILINE
+          )
+
+          blocked = [
+              ".github/",
+              ".env",
+              "secrets",
+              "credentials",
+              "package-lock.json",
+              "yarn.lock",
+              "pnpm-lock.yaml",
+              "gradle.lockfile"
+          ]
+
+          for path in paths:
+              if any(item in path.lower() for item in blocked):
+                  raise Exception(
+                      f"Blocked file modification: {path}"
+                  )
+
+          subprocess.run(
+              ["git", "apply", "--check", "sarvam.patch"],
+              check=True
+          )
+
+          print("Patch validation passed.")
+          PY
+
+      - name: Apply fix
+        run: |
+          git apply sarvam.patch
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ github.token }}
+          branch: sarvam-ai-fix-${{ github.event.workflow_run.id }}
+          base: ${{ github.event.workflow_run.head_branch }}
+          commit-message: "fix: automated Sarvam AI build repair"
+          title: "🤖 Sarvam AI: Automated build fix"
+          body: |
+            ## Sarvam AI Automated Fix
+
+            This PR was generated automatically after a failed GitHub Actions run.
+
+            **Failed run:** ${{ github.event.workflow_run.html_url }}
+
+            Please review all changes before merging.
+
+            Generated by Sarvam AI.
+          labels: automated-fix
+          delete-branch: true
