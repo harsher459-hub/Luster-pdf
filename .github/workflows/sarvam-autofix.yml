@@ -1,0 +1,93 @@
+name: Sarvam AI Auto Fix
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  sarvam-fix:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get failed workflow logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run view ${{ github.event.workflow_run.id }} --log-failed > error.log || true
+
+      - name: Call Sarvam AI
+        env:
+          SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          logs = open("error.log", encoding="utf-8", errors="replace").read()
+
+          prompt = f"""
+          Analyze these GitHub Actions build errors.
+
+          Find:
+          1. Root cause
+          2. Exact files that need fixing
+          3. Recommended solution
+
+          Do not invent files or dependencies.
+
+          ERROR LOG:
+          {logs[-15000:]}
+          """
+
+          response = requests.post(
+              "https://api.sarvam.ai/v1/chat/completions",
+              headers={
+                  "api-subscription-key": os.environ["SARVAM_API_KEY"],
+                  "Content-Type": "application/json"
+              },
+              json={
+                  "model": "sarvam-105b",
+                  "messages": [
+                      {
+                          "role": "system",
+                          "content": "You are an expert software debugging assistant."
+                      },
+                      {
+                          "role": "user",
+                          "content": prompt
+                      }
+                  ],
+                  "temperature": 0.1
+              },
+              timeout=120
+          )
+
+          response.raise_for_status()
+
+          result = response.json()
+          answer = result["choices"][0]["message"]["content"]
+
+          with open("sarvam-report.md", "w", encoding="utf-8") as f:
+              f.write("# Sarvam AI Build Failure Analysis\n\n")
+              f.write(answer)
+
+          print(answer)
+          PY
+
+      - name: Upload Sarvam report
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarvam-error-analysis
+          path: sarvam-report.md
